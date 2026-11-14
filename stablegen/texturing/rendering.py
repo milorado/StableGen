@@ -1,6 +1,7 @@
 """Mask processing, render exports, visibility, texture baking, and material helpers."""
 
 import os
+from ..util.output_paths import safe_output_path
 import math
 from contextlib import contextmanager
 import bpy, bmesh  # pylint: disable=import-error
@@ -2792,11 +2793,11 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
                 output_dir = get_dir_path(context, "baked")
             os.makedirs(output_dir, exist_ok=True)
             if output_name is not None:
-                image.filepath_raw = os.path.join(output_dir, f"{output_name}.png")
+                image.filepath_raw = safe_output_path(output_dir, f"{output_name}.png")
             elif suffix == "":
-                image.filepath_raw = os.path.join(output_dir, f"{obj.name}.png")
+                image.filepath_raw = safe_output_path(output_dir, f"{obj.name}.png")
             else:
-                image.filepath_raw = os.path.join(
+                image.filepath_raw = safe_output_path(
                     output_dir, f"{obj.name}_baked{suffix}.png")
             if suffix == "":
                 _keep_earlier_bake(image.filepath_raw, keep=image)
@@ -2919,7 +2920,7 @@ def _remove_stale_pbr_maps(output_dir, object_name, channels):
     for channel, suffix in _PBR_CHANNEL_SUFFIXES.items():
         if channel == 'base_color' or channel in channels:
             continue
-        path = os.path.join(output_dir, f"{object_name}_{suffix}.png")
+        path = safe_output_path(output_dir, f"{object_name}_{suffix}.png")
         if os.path.isfile(path):
             _keep_earlier_bake(path)
             os.remove(path)
@@ -3197,7 +3198,7 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
 
         # ── Save ───────────────────────────────────────────────────
         os.makedirs(output_dir, exist_ok=True)
-        out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
+        out_path = safe_output_path(output_dir, f"{obj.name}_{suffix}.png")
         _keep_earlier_bake(out_path, keep=bake_img)
         bake_img.filepath_raw = out_path
         bake_img.file_format = 'PNG'
@@ -3242,8 +3243,8 @@ def _pack_orm_texture(output_dir, obj_name):
     """
     import numpy as np
 
-    rough_path = os.path.join(output_dir, f"{obj_name}_Roughness.png")
-    metal_path = os.path.join(output_dir, f"{obj_name}_Metallic.png")
+    rough_path = safe_output_path(output_dir, f"{obj_name}_Roughness.png")
+    metal_path = safe_output_path(output_dir, f"{obj_name}_Metallic.png")
     if not os.path.exists(rough_path) or not os.path.exists(metal_path):
         return None
 
@@ -3254,7 +3255,7 @@ def _pack_orm_texture(output_dir, obj_name):
     rough_px = np.array(rough_img.pixels[:]).reshape(h, w, 4)
     metal_px = np.array(metal_img.pixels[:]).reshape(h, w, 4)
 
-    ao_path = os.path.join(output_dir, f"{obj_name}_AO.png")
+    ao_path = safe_output_path(output_dir, f"{obj_name}_AO.png")
     if os.path.exists(ao_path):
         ao_img = bpy.data.images.load(ao_path, check_existing=True)
         ao_px = np.array(ao_img.pixels[:]).reshape(h, w, 4)
@@ -3270,7 +3271,7 @@ def _pack_orm_texture(output_dir, obj_name):
     orm_img = bpy.data.images.new(name=f"{obj_name}_ORM", width=w, height=h)
     orm_img.pixels = orm.flatten().tolist()
 
-    orm_path = os.path.join(output_dir, f"{obj_name}_ORM.png")
+    orm_path = safe_output_path(output_dir, f"{obj_name}_ORM.png")
     _keep_earlier_bake(orm_path, keep=orm_img)
     orm_img.filepath_raw = orm_path
     orm_img.file_format = 'PNG'
@@ -3439,6 +3440,16 @@ class BakeTextures(bpy.types.Operator):
         self._stage = "Preparing"
 
     def execute(self, context):
+        self._bake_snapshot = None
+        self._timer = None
+        try:
+            return self._execute_bake(context)
+        except Exception as error:
+            self._cleanup_bake(context)
+            self.report({'ERROR'}, f"Bake failed: {error}")
+            return {'CANCELLED'}
+
+    def _execute_bake(self, context):
         """     
         Executes the operator.         
         :param context: Blender context.         
@@ -3482,6 +3493,16 @@ class BakeTextures(bpy.types.Operator):
             )
         except Exception:
             self._original_compute_device_type = None
+        shadings = [(space.shading, space.shading.type)
+                    for window in context.window_manager.windows
+                    for area in window.screen.areas if area.type == 'VIEW_3D'
+                    for space in area.spaces if space.type == 'VIEW_3D']
+        self._bake_snapshot = (
+            context.scene, self.original_engine, self.original_device,
+            self.original_samples, self.original_max_bounces,
+            self.original_persistent, self.original_use_denoising,
+            self._original_compute_device_type, shadings,
+        )
         # Set render engine to CYCLES (required for baking)
         if bpy.context.scene.render.engine != 'CYCLES':
             bpy.context.scene.render.engine = 'CYCLES'
@@ -3506,6 +3527,61 @@ class BakeTextures(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
+        if event.type == 'ESC':
+            self._cleanup_bake(context)
+            return {'CANCELLED'}
+        try:
+            return self._modal_bake(context, event)
+        except Exception as error:
+            self._cleanup_bake(context)
+            self.report({'ERROR'}, f"Bake failed: {error}")
+            return {'CANCELLED'}
+
+    def cancel(self, context):
+        self._cleanup_bake(context)
+
+    def _cleanup_bake(self, context):
+        timer, self._timer = getattr(self, '_timer', None), None
+        if timer is not None:
+            try:
+                context.window_manager.event_timer_remove(timer)
+            except (ReferenceError, RuntimeError):
+                pass
+        snapshot, self._bake_snapshot = getattr(self, '_bake_snapshot', None), None
+        if snapshot is None:
+            return
+        scene, engine, device, samples, bounces, persistent, denoising, compute, shadings = snapshot
+        preferences = context.preferences
+
+        def defer_restore():
+            try:
+                scene.render.use_persistent_data = False
+                scene.cycles.device = 'CPU'
+                if context.scene == scene:
+                    context.view_layer.update()
+                scene.render.engine = engine
+                scene.cycles.device = device
+                scene.cycles.samples = samples
+                scene.cycles.max_bounces = bounces
+                scene.render.use_persistent_data = persistent
+                if hasattr(scene.cycles, 'use_denoising'):
+                    scene.cycles.use_denoising = denoising
+                if compute is not None:
+                    preferences.addons['cycles'].preferences.compute_device_type = compute
+            except Exception as error:
+                print(f"[StableGen] Error restoring bake settings: {error}")
+            finally:
+                for shading, value in shadings:
+                    try:
+                        shading.type = value
+                    except ReferenceError:
+                        pass
+            return None
+
+        # Release the bake's GPU context outside its modal callback.
+        bpy.app.timers.register(defer_restore, first_interval=0.2)
+
+    def _modal_bake(self, context, event):
         """     
         Handles modal events.         
         :param context: Blender context.         
@@ -3537,8 +3613,7 @@ class BakeTextures(bpy.types.Operator):
                         out_dir = get_dir_path(context, "baked")
                         for obj in self._objects:
                             _flip_normal_green(
-                                os.path.join(out_dir,
-                                             f"{obj.name}_Normal.png"))
+                                safe_output_path(out_dir, f"{obj.name}_Normal.png"))
                     # Pack ORM
                     if self.export_orm:
                         self.report({'INFO'}, "Packing ORM textures...")
@@ -3601,14 +3676,14 @@ class BakeTextures(bpy.types.Operator):
                         redraw()
                         if not bake_texture(context, obj, self.texture_resolution, output_dir=get_dir_path(context, "baked")):
                             self.report({'ERROR'}, f"Failed to bake texture for {obj.name}. No materials found.")
-                            context.window_manager.event_timer_remove(self._timer)
+                            self._cleanup_bake(context)
                             return {'CANCELLED'}
 
                         # Copy fallback diffuse bake to PBR BaseColor if bake_pbr is True
                         if self.bake_pbr:
                             baked_dir = get_dir_path(context, "baked")
-                            src_path = os.path.join(baked_dir, f"{obj.name}.png")
-                            dst_path = os.path.join(baked_dir, f"{obj.name}_BaseColor.png")
+                            src_path = safe_output_path(baked_dir, f"{obj.name}.png")
+                            dst_path = safe_output_path(baked_dir, f"{obj.name}_BaseColor.png")
                             if os.path.exists(src_path):
                                 import shutil
                                 try:
@@ -3676,66 +3751,8 @@ class BakeTextures(bpy.types.Operator):
                     self._phase = 'apply_material'
                     self._current_index = 0
                 else:
-                    context.window_manager.event_timer_remove(self._timer)
-                    
-                    # Capture original settings in local variables to avoid closures referencing self,
-                    # as self (the operator instance) may be destroyed by Blender when modal exits.
-                    orig_engine = str(self.original_engine)
-                    orig_device = str(self.original_device)
-                    orig_samples = int(self.original_samples)
-                    orig_max_bounces = int(self.original_max_bounces)
-                    orig_persistent = bool(self.original_persistent)
-                    orig_use_denoising = bool(self.original_use_denoising)
-                    orig_compute_device = self._original_compute_device_type
-                    if orig_compute_device is not None:
-                        orig_compute_device = str(orig_compute_device)
-                    orig_shading = str(self.original_shading)
-                    
-                    # Define defer restore function to run outside modal loop
-                    def defer_restore():
-                        try:
-                            # 1. Disable Cycles persistent data to release caches
-                            bpy.context.scene.render.use_persistent_data = False
-                            
-                            # 2. Switch Cycles to CPU device to free GPU contexts and memory
-                            bpy.context.scene.cycles.device = 'CPU'
-                            
-                            # 3. Update view layer to ensure Cycles releases everything
-                            bpy.context.view_layer.update()
-                            
-                            # 4. Now restore the render engine
-                            if bpy.context.scene.render.engine != orig_engine:
-                                bpy.context.scene.render.engine = orig_engine
-                            
-                            # 5. Restore other scene/Cycles settings
-                            bpy.context.scene.cycles.device = orig_device
-                            bpy.context.scene.cycles.samples = orig_samples
-                            bpy.context.scene.cycles.max_bounces = orig_max_bounces
-                            bpy.context.scene.render.use_persistent_data = orig_persistent
-                            if hasattr(bpy.context.scene.cycles, 'use_denoising'):
-                                bpy.context.scene.cycles.use_denoising = orig_use_denoising
-                            if orig_compute_device is not None:
-                                try:
-                                    bpy.context.preferences.addons['cycles'].preferences.compute_device_type = orig_compute_device
-                                except Exception:
-                                    pass
-                            
-                            # 6. Restore original viewport shading in all screens
-                            for window in bpy.context.window_manager.windows:
-                                for area in window.screen.areas:
-                                    if area.type == 'VIEW_3D':
-                                        for space in area.spaces:
-                                            if space.type == 'VIEW_3D':
-                                                space.shading.type = orig_shading
-                                                break
-                            remove_empty_dirs(bpy.context)
-                        except Exception as e:
-                            print(f"[StableGen] Error in defer_restore: {e}")
-                        return None
-                    
-                    import bpy
-                    bpy.app.timers.register(defer_restore, first_interval=0.2)
-                    
+                    self._cleanup_bake(context)
+                    remove_empty_dirs(context)
                     self.report({'INFO'}, "Textures baked successfully.")
                     return {'FINISHED'}
         return {'PASS_THROUGH'}
@@ -3785,7 +3802,7 @@ class BakeTextures(bpy.types.Operator):
         uv_node.location = (-600, 0)
 
         # ── Base Color ────────────────────────────────────────────────
-        base_path = os.path.join(output_dir, f"{obj.name}_BaseColor.png")
+        base_path = safe_output_path(output_dir, f"{obj.name}_BaseColor.png")
         if not os.path.exists(base_path):
             # Fallback to standard diffuse bake
             base_path = get_file_path(context, "baked", object_name=obj.name)
@@ -3813,7 +3830,7 @@ class BakeTextures(bpy.types.Operator):
         y_pos = -100
 
         # Roughness
-        rough_path = os.path.join(output_dir, f"{obj.name}_Roughness.png")
+        rough_path = safe_output_path(output_dir, f"{obj.name}_Roughness.png")
         if os.path.exists(rough_path):
             y_pos -= 250
             tex = nodes.new("ShaderNodeTexImage")
@@ -3826,7 +3843,7 @@ class BakeTextures(bpy.types.Operator):
                       principled.inputs["Roughness"])
 
         # Metallic
-        metal_path = os.path.join(output_dir, f"{obj.name}_Metallic.png")
+        metal_path = safe_output_path(output_dir, f"{obj.name}_Metallic.png")
         if os.path.exists(metal_path):
             y_pos -= 250
             tex = nodes.new("ShaderNodeTexImage")
@@ -3839,7 +3856,7 @@ class BakeTextures(bpy.types.Operator):
                       principled.inputs["Metallic"])
 
         # Normal
-        normal_path = os.path.join(output_dir, f"{obj.name}_Normal.png")
+        normal_path = safe_output_path(output_dir, f"{obj.name}_Normal.png")
         if os.path.exists(normal_path):
             y_pos -= 250
             tex = nodes.new("ShaderNodeTexImage")
@@ -3866,8 +3883,7 @@ class BakeTextures(bpy.types.Operator):
                           principled.inputs["Normal"])
 
         # Emission
-        emission_path = os.path.join(output_dir,
-                                     f"{obj.name}_Emission.png")
+        emission_path = safe_output_path(output_dir, f"{obj.name}_Emission.png")
         if os.path.exists(emission_path):
             y_pos -= 250
             tex = nodes.new("ShaderNodeTexImage")
@@ -3884,8 +3900,7 @@ class BakeTextures(bpy.types.Operator):
                     "Emission Strength"].default_value = 1.0
 
         # Height → Displacement
-        height_path = os.path.join(output_dir,
-                                   f"{obj.name}_Height.png")
+        height_path = safe_output_path(output_dir, f"{obj.name}_Height.png")
         if os.path.exists(height_path):
             y_pos -= 250
             tex = nodes.new("ShaderNodeTexImage")
@@ -3904,7 +3919,7 @@ class BakeTextures(bpy.types.Operator):
                       output_node.inputs["Displacement"])
 
         # AO → multiply with Base Color
-        ao_path = os.path.join(output_dir, f"{obj.name}_AO.png")
+        ao_path = safe_output_path(output_dir, f"{obj.name}_AO.png")
         if (os.path.exists(ao_path)
                 and principled.inputs["Base Color"].links):
             y_pos -= 250

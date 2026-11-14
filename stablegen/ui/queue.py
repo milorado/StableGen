@@ -84,10 +84,14 @@ def _sg_queue_save(processing=False, current_idx=0, phase='idle'):
     }
     try:
         fp = _sg_queue_filepath()
-        with open(fp, 'w', encoding='utf-8') as f:
+        temporary = fp + '.tmp'
+        with open(temporary, 'w', encoding='utf-8') as f:
             json.dump(data, f)
+        os.replace(temporary, fp)
+        return True
     except Exception as e:
         print(f"[Queue] save error: {e}")
+        return False
 
 
 def _sg_queue_load():
@@ -218,13 +222,17 @@ class SG_UL_SceneQueueList(bpy.types.UIList):
 def _persist_queue():
     """Write the queue + processing state to a JSON file on disk."""
     try:
-        _sg_queue_save(
+        return _sg_queue_save(
             processing=_queue_processing,
             current_idx=_queue_current_idx,
             phase=_queue_phase,
         )
     except Exception:
-        pass
+        return False
+
+
+def _queue_has_save_error():
+    return _queue_phase in ('save_failed_result', 'save_failed_switch')
 
 
 def _resume_queue(idx):
@@ -271,7 +279,7 @@ class SceneQueueAdd(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _queue_processing and not sg_modal_active(context)
+        return not _queue_processing and not _queue_has_save_error() and not sg_modal_active(context)
 
     def invoke(self, context, event):
         scene = context.scene
@@ -350,7 +358,7 @@ class SceneQueueRemove(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         wm = context.window_manager
-        return not _queue_processing and len(wm.sg_scene_queue) > 0 and not sg_modal_active(context)
+        return not _queue_processing and not _queue_has_save_error() and len(wm.sg_scene_queue) > 0 and not sg_modal_active(context)
 
     def invoke(self, context, event):
         wm = context.window_manager
@@ -394,7 +402,7 @@ class SceneQueueClear(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         wm = context.window_manager
-        return not _queue_processing and len(wm.sg_scene_queue) > 0 and not sg_modal_active(context)
+        return not _queue_processing and not _queue_has_save_error() and len(wm.sg_scene_queue) > 0 and not sg_modal_active(context)
 
     def invoke(self, context, event):
         wm = context.window_manager
@@ -429,7 +437,7 @@ class SceneQueueMoveUp(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         wm = context.window_manager
-        return not _queue_processing and wm.sg_scene_queue_index > 0 and not sg_modal_active(context)
+        return not _queue_processing and not _queue_has_save_error() and wm.sg_scene_queue_index > 0 and not sg_modal_active(context)
 
     def execute(self, context):
         wm = context.window_manager
@@ -447,7 +455,7 @@ class SceneQueueMoveDown(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         wm = context.window_manager
-        return (not _queue_processing
+        return (not _queue_processing and not _queue_has_save_error()
                 and wm.sg_scene_queue_index < len(wm.sg_scene_queue) - 1
                 and not sg_modal_active(context))
 
@@ -467,7 +475,7 @@ class SceneQueueOpenResult(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        if sg_modal_active(context):
+        if _queue_has_save_error() or sg_modal_active(context):
             return False
         wm = context.window_manager
         idx = wm.sg_scene_queue_index
@@ -503,8 +511,8 @@ class SceneQueueInvalidate(bpy.types.Operator):
     def poll(cls, context):
         wm = context.window_manager
         idx = wm.sg_scene_queue_index
-        if _queue_processing:
-            cls.poll_message_set("Queue is currently processing")
+        if _queue_processing or _queue_has_save_error():
+            cls.poll_message_set("Queue is processing or waiting for a successful save")
             return False
         if sg_modal_active(context):
             cls.poll_message_set("Another operation is in progress")
@@ -641,6 +649,22 @@ class SceneQueueProcess(bpy.types.Operator):
             self.report({'WARNING'}, "Queue processing cancelled.")
             return {'FINISHED'}
 
+        if _queue_has_save_error():
+            item = context.window_manager.sg_scene_queue[_queue_current_idx]
+            _queue_processing = True
+            if _queue_phase == 'save_failed_result':
+                _queue_save_and_advance(item)
+            elif _queue_save_current(item):
+                item.status = 'pending'
+                _queue_phase = 'idle'
+                _persist_queue()
+            if _queue_has_save_error():
+                self.report({'ERROR'}, item.error_reason)
+                return {'CANCELLED'}
+            if _queue_processing and _queue_phase == 'idle':
+                _queue_timer = bpy.app.timers.register(_queue_tick, first_interval=0.5)
+            return {'FINISHED'}
+
         # Reset statuses
         wm = context.window_manager
         for item in wm.sg_scene_queue:
@@ -680,7 +704,8 @@ def _queue_tick():
     global _queue_refresh_deadline
 
     if not _queue_processing:
-        _queue_phase = 'idle'
+        if not _queue_has_save_error():
+            _queue_phase = 'idle'
         _queue_timer = None
         _tag_redraw()
         return None  # Stop timer
@@ -727,15 +752,20 @@ def _queue_tick():
             # Save current file first so nothing is lost — BUT skip save
             # on retry reloads; we want to discard dirty state and revert
             # to the original clean copy.
-            if bpy.data.filepath and not is_retry_reload:
-                try:
-                    bpy.ops.wm.save_mainfile()
-                except Exception as e:
-                    print(f"[Queue] Warning: could not save current file: {e}")
+            if not is_retry_reload and not _queue_save_current(item):
+                return None
 
             # Persist state so the load_post handler can resume after
             # the new file is opened.
-            _persist_queue()
+            if _persist_queue() is False:
+                item.status = 'error'
+                item.error_reason = 'Could not persist queue state; current scene retained'
+                _queue_processing = False
+                _queue_phase = 'save_failed_switch'
+                _queue_timer = None
+                print(f"[Queue] {item.error_reason}")
+                _tag_redraw()
+                return None
             print(f"[Queue] Opening '{os.path.basename(target)}' for item "
                   f"'{item.scene_name}'...")
 
@@ -1006,9 +1036,6 @@ def _queue_finish_item(item):
     """
     global _queue_current_idx, _queue_phase, _queue_processing, _queue_timer
 
-    item.status = 'done'
-    print(f"[Queue] Finished '{item.scene_name}'")
-
     # ── Optional GIF export before saving ──
     wm = bpy.context.window_manager
     if getattr(wm, 'sg_queue_gif_export', False):
@@ -1182,17 +1209,38 @@ def _queue_restore_pbr():
     print(f"[Queue] Restored pbr_decomposition={_queue_original_pbr}")
 
 
+def _queue_save_current(item, failure_phase='save_failed_switch', require_filepath=False):
+    """Pause without unloading the scene unless Blender confirms its save."""
+    global _queue_processing, _queue_phase, _queue_timer
+    try:
+        if not bpy.data.filepath:
+            if require_filepath or bpy.data.is_dirty:
+                raise RuntimeError('Save the current untitled scene before processing the queue')
+        elif 'FINISHED' not in bpy.ops.wm.save_mainfile():
+            raise RuntimeError('Blender cancelled saving the current scene')
+        item.error_reason = ''
+        return True
+    except Exception as e:
+        item.status = 'error'
+        item.error_reason = f'Save failed; current scene retained: {e}'
+        _queue_processing = False
+        _queue_phase = failure_phase
+        _queue_timer = None
+        print(f"[Queue] {item.error_reason}")
+        _persist_queue()
+        _tag_redraw()
+        return False
+
+
 def _queue_save_and_advance(item):
     """Save the current .blend and advance to the next queue item."""
     global _queue_current_idx, _queue_phase, _queue_processing, _queue_timer
 
     # Save the result in-place on the queue copy .blend
-    if bpy.data.filepath:
-        try:
-            bpy.ops.wm.save_mainfile()
-            print(f"[Queue] Saved result: {bpy.data.filepath}")
-        except Exception as e:
-            print(f"[Queue] Save warning: {e}")
+    if not _queue_save_current(item, 'save_failed_result', require_filepath=True):
+        return
+    item.status = 'done'
+    print(f"[Queue] Saved result: {bpy.data.filepath}")
 
     # Advance to next pending item
     _queue_current_idx += 1

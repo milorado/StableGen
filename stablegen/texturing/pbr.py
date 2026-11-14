@@ -6,6 +6,7 @@ call sites remain unchanged.
 """
 
 import os
+from ..util.image_io import open_backend_image
 import json
 import io
 import math
@@ -400,7 +401,7 @@ class _PBRMixin:
             # Resize model output to expected upscaled tile dims
             resized = []
             for map_bytes in result:
-                map_img = Image.open(io.BytesIO(map_bytes))
+                map_img = open_backend_image(map_bytes)
                 if map_img.size != (up_w, up_h):
                     map_img = map_img.resize((up_w, up_h), Image.LANCZOS)
                 buf = io.BytesIO()
@@ -432,7 +433,7 @@ class _PBRMixin:
 
             for i, (l, t, r, b, fl, fr, ft, fb) in enumerate(tile_info):
                 tile_bytes = all_tile_results[i][map_idx]
-                tile_img = Image.open(io.BytesIO(tile_bytes)).convert('RGB')
+                tile_img = open_backend_image(tile_bytes).convert('RGB')
 
                 if superres:
                     up_w, up_h = tile_up_sizes[i]
@@ -494,7 +495,7 @@ class _PBRMixin:
         Returns PNG bytes, or ``None`` on failure.
         """
         try:
-            img = Image.open(io.BytesIO(map_bytes)).convert('RGB')
+            img = open_backend_image(map_bytes).convert('RGB')
             arr = np.asarray(img, dtype=np.float32) / 255.0  # [H, W, 3] in [0,1]
 
             # Decode to [-1, 1]
@@ -554,7 +555,7 @@ class _PBRMixin:
             if isinstance(image_path_or_bytes, str):
                 img = Image.open(image_path_or_bytes).convert('RGB')
             else:
-                img = Image.open(io.BytesIO(image_path_or_bytes)).convert('RGB')
+                img = open_backend_image(image_path_or_bytes).convert('RGB')
 
             rgb = np.asarray(img, dtype=np.float32) / 255.0
             value = rgb.max(axis=-1)
@@ -760,10 +761,11 @@ class _PBRMixin:
         Returns post-processed PNG bytes, or the original bytes unchanged
         if saturation is 1.0 (no-op).
         """
-        if saturation == 1.0:
-            return image_bytes
-        from PIL import Image, ImageEnhance
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+        from PIL import ImageEnhance
+        with open_backend_image(image_bytes) as source:
+            if saturation == 1.0:
+                return image_bytes
+            img = source.convert('RGB')
         img = ImageEnhance.Color(img).enhance(saturation)
         buf = io.BytesIO()
         img.save(buf, format='PNG')
@@ -1355,7 +1357,7 @@ class _PBRMixin:
             # ── IID-Appearance "material" channel split ───────────
             if map_name == 'material':
                 try:
-                    mat_img = Image.open(io.BytesIO(map_bytes)).convert('RGB')
+                    mat_img = open_backend_image(map_bytes).convert('RGB')
                 except Exception as err:
                     print(f"[StableGen]     Failed to decode material image: {err}")
                     continue

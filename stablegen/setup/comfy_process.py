@@ -8,6 +8,7 @@ alone and the next free port is used. StableGen only ever stops a ComfyUI it sta
 No bpy here: the add-on drives it from timers and operators, and the tests run it with a fake ComfyUI.
 """
 import json
+import hashlib
 import os
 import socket
 import subprocess
@@ -116,6 +117,44 @@ def stop_pid_tree(pid: int, timeout: float = 30.0):
                 return
 
 
+def process_identity(pid: int) -> Optional[str]:
+    """Fingerprint process creation and executable; fail closed if unavailable."""
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            handle = wintypes.HANDLE(kernel32.OpenProcess(0x1000, False, int(pid)))
+            if not handle:
+                return None
+            try:
+                created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+                name = ctypes.create_unicode_buffer(32768)
+                size = wintypes.DWORD(len(name))
+                if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                                ctypes.byref(kernel), ctypes.byref(user)):
+                    return None
+                if not kernel32.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size)):
+                    return None
+                identity = f'{created.dwHighDateTime}:{created.dwLowDateTime}:{name.value}'
+            finally:
+                kernel32.CloseHandle(handle)
+        elif sys.platform.startswith('linux'):
+            proc = Path('/proc') / str(int(pid))
+            start = (proc / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+            identity = f'{start}:{os.readlink(proc / "exe")}:{(proc / "cmdline").read_bytes()!r}'
+        else:
+            result = subprocess.run(['ps', '-p', str(int(pid)), '-o', 'lstart=', '-o', 'command='],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode or not result.stdout.strip():
+                return None
+            identity = result.stdout.strip()
+        return hashlib.sha256(identity.encode()).hexdigest()
+    except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+        return None
+
+
 def comfyui_python(folder: Path) -> Optional[str]:
     """ComfyUI's own Python for this folder (portable build, venv, .venv), never Blender's."""
     for candidate in installer.python_candidates(Path(folder)):
@@ -178,6 +217,7 @@ class LocalComfyUI:
         self.state = "stopped"
         self.message = ""
         self.started_at = 0.0
+        self._identity = None
         self._watch: Optional[threading.Thread] = None
 
     @property
@@ -223,6 +263,7 @@ class LocalComfyUI:
             self.proc = subprocess.Popen(cmd, cwd=str(folder), stdout=log, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL, env=child_env, **kwargs)
         self.pid, self.port, self.folder = self.proc.pid, port, folder
+        self._identity = process_identity(self.pid)
         self.state, self.message, self.started_at = "starting", "", time.time()
         self._write_record()
         self._watch = threading.Thread(target=self._watch_ready, daemon=True)
@@ -252,9 +293,12 @@ class LocalComfyUI:
         """A ComfyUI for this folder already answers on port. Ours if the record says so; one started by hand is
         used but never stopped."""
         record = self._read_record()
-        ours = record and record.get("port") == port and same_folder(record.get("folder", ""), folder)
+        identity = process_identity(record['pid']) if record and record.get('pid') else None
+        ours = (record and record.get("port") == port and same_folder(record.get("folder", ""), folder)
+                and identity and identity == record.get('identity'))
         self.proc = None
         self.pid = record["pid"] if ours and pid_alive(record.get("pid")) else None
+        self._identity = identity if self.pid else None
         self.port, self.folder = port, folder
         self.state, self.message = "running", "" if self.pid else "started outside StableGen"
 
@@ -266,10 +310,14 @@ class LocalComfyUI:
         if not pid_alive(record.get("pid")):
             self._clear_record()
             return False
-        self.pid, self.port, self.folder = record["pid"], record["port"], Path(record["folder"])
+        self.proc, self.pid, self._identity = None, None, None
+        self.port, self.folder = record["port"], Path(record["folder"])
+        identity = process_identity(record['pid'])
         found = server_folder(self.address)
         if found is not None and same_folder(found, self.folder):
-            self.state, self.message = "running", ""
+            if identity and identity == record.get('identity'):
+                self.pid, self._identity = record['pid'], identity
+            self.state, self.message = "running", "" if self.pid else "started outside StableGen"
             return True
         self.state, self.message = "unresponsive", "an earlier ComfyUI is still running but does not answer"
         return False
@@ -289,9 +337,11 @@ class LocalComfyUI:
         """Stop the ComfyUI StableGen started; one started outside StableGen is only let go."""
         if self.proc is not None:
             installer._stop_process_tree(self.proc)
-        elif self.pid and pid_alive(self.pid):
+        elif (self.pid and self._identity and pid_alive(self.pid)
+              and process_identity(self.pid) == self._identity):
             stop_pid_tree(self.pid)
         self.proc, self.pid = None, None
+        self._identity = None
         self.state, self.message = "stopped", ""
         self._clear_record()
 
@@ -312,7 +362,7 @@ class LocalComfyUI:
     def _write_record(self):
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.record_path.write_text(json.dumps({"pid": self.pid, "port": self.port, "folder": str(self.folder),
-                                                "started": self.started_at}), encoding="utf-8")
+                                                "started": self.started_at, "identity": self._identity}), encoding="utf-8")
 
     def _clear_record(self):
         try:

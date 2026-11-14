@@ -10,6 +10,7 @@ import math
 import bpy  # pylint: disable=import-error
 import numpy as np
 from mathutils import Vector  # pylint: disable=import-error
+from bpy.app.handlers import persistent
 
 from .geometry import _get_camera_resolution
 
@@ -187,3 +188,38 @@ def clear():
     if _timer is not None and bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     _timer = None
+
+
+@persistent
+def _geometry_updated(scene, depsgraph):
+    if any(update.is_updated_geometry or isinstance(update.id, bpy.types.Armature)
+           or (isinstance(update.id, bpy.types.Object) and update.id.type == 'ARMATURE')
+           for update in depsgraph.updates):
+        _cache.clear()
+
+
+@persistent
+def _frame_changed(*_args):
+    _cache.clear()
+
+
+@persistent
+def _file_loaded(*_args):
+    clear()
+
+
+def register():
+    for handlers, callback in ((bpy.app.handlers.depsgraph_update_post, _geometry_updated),
+                               (bpy.app.handlers.frame_change_post, _frame_changed),
+                               (bpy.app.handlers.load_post, _file_loaded)):
+        if callback not in handlers:
+            handlers.append(callback)
+
+
+def unregister():
+    for handlers, callback in ((bpy.app.handlers.depsgraph_update_post, _geometry_updated),
+                               (bpy.app.handlers.frame_change_post, _frame_changed),
+                               (bpy.app.handlers.load_post, _file_loaded)):
+        if callback in handlers:
+            handlers.remove(callback)
+    clear()

@@ -1,3 +1,4 @@
+from ..util.image_io import open_backend_image
 from ..core.feature_flags import experimental_enabled
 """ComfyUI texture generation operator (core pipeline)."""
 
@@ -756,7 +757,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         value_adjust = context.scene.qwen_context_cleanup_value_adjust
         fallback_color = tuple(context.scene.qwen_guidance_fallback_color)
         try:
-            with Image.open(io.BytesIO(image_bytes)) as pil_image:
+            with open_backend_image(image_bytes) as pil_image:
                 pixel_data = np.array(pil_image.convert("RGBA"))
         except Exception as err:
             print(f"[StableGen] Warning: failed to read Qwen image for cleanup: {err}")

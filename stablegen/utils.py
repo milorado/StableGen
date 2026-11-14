@@ -1,5 +1,6 @@
 import bpy
 import os
+from .util.output_paths import safe_output_path
 from datetime import datetime
 
 # ── Heavy modal operators that should block most other panel buttons ──
@@ -413,13 +414,13 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 		base_dir = dirs["generated_baked"]
 		if object_name:
 			material_suffix = f"{camera_id}-{material_id}" if material_id is not None else ""
-			return os.path.join(base_dir, f"{object_name}_baked{material_suffix}.png")
+			return safe_output_path(base_dir, f"{object_name}_baked{material_suffix}.png")
 	
 	elif file_type == "baked":
 		base_dir = dirs["baked"]
 		if not filename:
 			filename = f"{object_name}" if object_name else "baked_texture"
-		return os.path.join(base_dir, f"{filename}.png")
+		return safe_output_path(base_dir, f"{filename}.png")
 	
 	elif file_type == "inpaint" and subtype:
 		base_dir = dirs["inpaint"][subtype]
