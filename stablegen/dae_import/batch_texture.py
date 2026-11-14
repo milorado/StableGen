@@ -807,11 +807,18 @@ def _do_export():
     if bpy.context.selected_objects:
         bpy.context.view_layer.objects.active = bpy.context.selected_objects[0]
 
+    temporary = out_path + '.partial.glb'
     try:
-        bpy.ops.export_scene.gltf(filepath=out_path)
+        if os.path.exists(temporary):
+            os.remove(temporary)
+        result = bpy.ops.export_scene.gltf(filepath=temporary, export_format='GLB')
+        if 'FINISHED' not in result or not os.path.isfile(temporary) or os.path.getsize(temporary) == 0:
+            raise RuntimeError('GLB export did not produce a complete asset')
+        os.replace(temporary, out_path)
         print(f"[BatchTex] Exported: {out_path}")
-    except Exception as exc:  # noqa: BLE001
-        print(f"[BatchTex] FAILED to export: {exc}")
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 
 # ── State machine tick ──────────────────────────────────────────────────────
@@ -994,6 +1001,7 @@ def _batch_tex_tick():
             _do_export()
         except Exception as exc:  # noqa: BLE001
             print(f"[BatchTex] Export failed: {exc}")
+            return _retry_or_skip('export', exc)
 
         state['phase'] = 'idle'
         return _TICK_INTERVAL
@@ -1251,7 +1259,13 @@ class BatchTextureDAE(bpy.types.Operator):
                     return {'CANCELLED'}
                 self.report({'INFO'}, "Using batch_manifest.csv from selected directory")
             else:
-                model_files = discover_model_files(top_dir, self.recursive)
+                configured_output = bpy.path.abspath(self.output_dir).strip()
+                out_dir = configured_output or os.path.join(top_dir, 'textured')
+                try:
+                    model_files = discover_model_files(top_dir, self.recursive, exclude_dirs=(out_dir,))
+                except ValueError as exc:
+                    self.report({'ERROR'}, str(exc))
+                    return {'CANCELLED'}
 
         if not model_files:
             self.report({'WARNING'}, "No DAE or GLB files found")

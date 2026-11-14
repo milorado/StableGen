@@ -1,3 +1,4 @@
+from .util.image_io import open_backend_image
 import bpy
 import os
 import json
@@ -91,7 +92,7 @@ class _WorkflowBase:
         actual unloading happens asynchronously in ComfyUI's execution loop.
         This method therefore:
           1. Sends ``/free`` (unload models + free memory).
-          2. Clears the execution cache history and queue.
+          2. Preserves history and queued work belonging to every client.
           3. Sends ``/free`` *again* — the first round triggers model unloads
              whose CUDA tensors may still reside in PyTorch's cache; the
              second round triggers ``soft_empty_cache`` which calls
@@ -99,6 +100,9 @@ class _WorkflowBase:
           4. Polls ``/system_stats`` waiting for VRAM to increase.
         Retries the whole sequence up to *retries* times.
         """
+        from .setup.runtime import owns_server
+        if not owns_server(server_address):
+            return False
         import time
 
         vram_before, vram_total = self._get_vram_stats(server_address)
@@ -118,37 +122,11 @@ class _WorkflowBase:
             )
             urllib.request.urlopen(r, timeout=get_timeout('api'))
 
-        def _clear_history():
-            d = json.dumps({"clear": True}).encode('utf-8')
-            r = urllib.request.Request(
-                f"http://{server_address}/history", data=d,
-                headers={'Content-Type': 'application/json'}, method='POST'
-            )
-            urllib.request.urlopen(r, timeout=get_timeout('api'))
-
-        def _clear_queue():
-            d = json.dumps({"clear": True}).encode('utf-8')
-            r = urllib.request.Request(
-                f"http://{server_address}/queue", data=d,
-                headers={'Content-Type': 'application/json'}, method='POST'
-            )
-            urllib.request.urlopen(r, timeout=get_timeout('api'))
-
         for attempt in range(1, retries + 1):
             try:
                 # Round 1: Unload models
                 _send_free()
                 time.sleep(1)
-
-                # Clear caches
-                try:
-                    _clear_history()
-                except Exception:
-                    pass
-                try:
-                    _clear_queue()
-                except Exception:
-                    pass
 
                 # Round 2: Free the now-released CUDA allocations
                 _send_free()
@@ -220,7 +198,8 @@ class _WorkflowBase:
         if not img_bytes:
             return False
         try:
-            Image.open(BytesIO(img_bytes)).verify()
+            with open_backend_image(img_bytes):
+                pass
             return True
         except Exception:
             return False
@@ -246,6 +225,8 @@ class _WorkflowBase:
                              f"&subfolder={urllib.parse.quote(subfolder)}"
                              f"&type={urllib.parse.quote(img_type)}")
                 data = urllib.request.urlopen(view_url, timeout=get_timeout('transfer')).read()
+                if not self._validate_image_bytes(data):
+                    raise ValueError("Invalid backend image")
                 result.append(data)
             return result
         except Exception as e:

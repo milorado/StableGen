@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+from ..util.output_paths import safe_output_path
 from array import array
 
 import bpy  # pylint: disable=import-error
@@ -271,42 +272,42 @@ class ExportForGameEngine(bpy.types.Operator):
 
         rigged_export = bool(armatures)
 
-        bpy.ops.object.select_all(action='DESELECT')
-        for obj in export_objects:
-            obj.select_set(True)
-        context.view_layer.objects.active = meshes[0]
-
-        # ── Output path ───────────────────────────────────────────────
-        output_base = get_dir_path(context, "baked")
-        os.makedirs(output_base, exist_ok=True)
-
-        # Build filename from first object name
-        base_name = meshes[0].name if meshes else "export"
-
-        if self.export_format == 'FBX':
-            ext = ".fbx"
-        elif self.export_format == 'GLTF_SEPARATE':
-            ext = ".gltf"
-        else:
-            ext = ".glb"
-        filepath = os.path.join(output_base, f"{base_name}{ext}")
-
-        # ── Apply transforms if requested ─────────────────────────────
-        if self.apply_transforms and rigged_export:
-            print(
-                "[StableGen] Rigged export detected; skipping transform apply "
-                "to preserve armature bind pose"
-            )
-        elif self.apply_transforms:
-            for o in meshes:
-                o.select_set(True)
-            bpy.ops.object.transform_apply(
-                location=True, rotation=True, scale=True)
-
-        # ── Export ────────────────────────────────────────────────────
         try:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in export_objects:
+                obj.select_set(True)
+            context.view_layer.objects.active = meshes[0]
+
+            # ── Output path ───────────────────────────────────────────────
+            output_base = get_dir_path(context, "baked")
+            os.makedirs(output_base, exist_ok=True)
+
+            # Build filename from first object name
+            base_name = meshes[0].name if meshes else "export"
+
+            if self.export_format == 'FBX':
+                ext = ".fbx"
+            elif self.export_format == 'GLTF_SEPARATE':
+                ext = ".gltf"
+            else:
+                ext = ".glb"
+            filepath = safe_output_path(output_base, f"{base_name}{ext}")
+
+            # ── Apply transforms if requested ─────────────────────────────
+            if self.apply_transforms and rigged_export:
+                print(
+                    "[StableGen] Rigged export detected; skipping transform apply "
+                    "to preserve armature bind pose"
+                )
+            elif self.apply_transforms:
+                for o in meshes:
+                    o.select_set(True)
+                bpy.ops.object.transform_apply(
+                    location=True, rotation=True, scale=True)
+
+            # ── Export ────────────────────────────────────────────────────
             if self.export_format in ('GLB', 'GLTF_SEPARATE'):
-                bpy.ops.export_scene.gltf(
+                result = bpy.ops.export_scene.gltf(
                     filepath=filepath,
                     export_format=self.export_format,
                     use_selection=True,
@@ -319,7 +320,7 @@ class ExportForGameEngine(bpy.types.Operator):
                 )
             else:  # FBX
                 with _fbx_ready_meshes(meshes):
-                    bpy.ops.export_scene.fbx(
+                    result = bpy.ops.export_scene.fbx(
                         filepath=filepath,
                         use_selection=True,
                         object_types={'MESH', 'ARMATURE'},
@@ -332,6 +333,9 @@ class ExportForGameEngine(bpy.types.Operator):
                         mesh_smooth_type='FACE',
                     )
 
+            if 'FINISHED' not in result or not os.path.isfile(filepath) or os.path.getsize(filepath) == 0:
+                raise RuntimeError('Export did not produce a complete asset')
+
             if rigged_export:
                 print(
                     f"[StableGen] Exported rigged asset with "
@@ -343,18 +347,19 @@ class ExportForGameEngine(bpy.types.Operator):
             self.report({'ERROR'}, f"Export failed: {e}")
             import traceback
             traceback.print_exc()
-
-        # ── Restore selection ─────────────────────────────────────────
-        bpy.ops.object.select_all(action='DESELECT')
-        for o in original_selection:
-            try:
-                o.select_set(True)
-            except ReferenceError:
-                pass
-        if original_active:
-            try:
-                context.view_layer.objects.active = original_active
-            except ReferenceError:
-                pass
+            return {'CANCELLED'}
+        finally:
+            # ── Restore selection ─────────────────────────────────────────
+            bpy.ops.object.select_all(action='DESELECT')
+            for o in original_selection:
+                try:
+                    o.select_set(True)
+                except ReferenceError:
+                    pass
+            if original_active:
+                try:
+                    context.view_layer.objects.active = original_active
+                except ReferenceError:
+                    pass
 
         return {'FINISHED'}

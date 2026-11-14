@@ -118,20 +118,34 @@ def load_batch_manifest(manifest_path: str) -> tuple[str, list[dict[str, str]]]:
     return root, entries
 
 
-def discover_model_files(root: str, recursive: bool = True) -> list[dict[str, str]]:
+def discover_model_files(root: str, recursive: bool = True, exclude_dirs=()) -> list[dict[str, str]]:
     """Discover DAE and GLB inputs in deterministic path order."""
     root_abs = os.path.realpath(root)
+    excluded = tuple(os.path.realpath(path) for path in exclude_dirs)
+    def is_excluded(path):
+        resolved = os.path.realpath(path)
+        for base in excluded:
+            try:
+                if os.path.commonpath((resolved, base)) == base:
+                    return True
+            except ValueError:  # Separate Windows drives cannot contain each other.
+                continue
+        return False
+    if is_excluded(root_abs):
+        raise ValueError('Output directory must not contain the input directory')
     paths: list[str] = []
     if recursive:
         for dirpath, dirnames, filenames in os.walk(root_abs):
-            dirnames.sort()
+            dirnames[:] = sorted(name for name in dirnames
+                                 if not is_excluded(os.path.join(dirpath, name)))
             for filename in sorted(filenames):
-                if os.path.splitext(filename)[1].lower() in SUPPORTED_MODEL_EXTENSIONS:
+                if (os.path.splitext(filename)[1].lower() in SUPPORTED_MODEL_EXTENSIONS
+                        and not is_excluded(os.path.join(dirpath, filename))):
                     paths.append(os.path.join(dirpath, filename))
     else:
         for filename in sorted(os.listdir(root_abs)):
             path = os.path.join(root_abs, filename)
-            if (os.path.isfile(path) and
+            if (os.path.isfile(path) and not is_excluded(path) and
                     os.path.splitext(filename)[1].lower() in
                     SUPPORTED_MODEL_EXTENSIONS):
                 paths.append(path)

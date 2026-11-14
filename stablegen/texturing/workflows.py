@@ -1,3 +1,4 @@
+from ..util.image_io import open_backend_image
 from ..core.feature_flags import experimental_enabled
 import bpy
 import os
@@ -510,13 +511,12 @@ class _TexturingWorkflowMixin:
             return None
 
         # --- Load image as RGBA without touching color ---
-        buf = BytesIO(img_bytes)
         try:
-            img = Image.open(buf).convert("RGBA")
+            img = open_backend_image(img_bytes).convert("RGBA")
         except Exception as e:
             print(f"[StableGen] _crop_and_vignette: cannot decode image "
-                  f"({len(img_bytes)} bytes): {e}  — returning raw bytes.")
-            return img_bytes
+                  f"({len(img_bytes)} bytes): {e}")
+            raise ValueError("Invalid backend image") from e
 
         # Corrected mode never crops because projection registration is not
         # adjusted for a changed image extent.
@@ -2537,7 +2537,7 @@ class _TexturingWorkflowMixin:
             return {"error": f"Marigold V2 {task} failed — no output received"}
         data = images[NODES['save_image']][0]
 
-        out = Image.open(BytesIO(data)).convert('RGB')
+        out = open_backend_image(data).convert('RGB')
         if out.size != (src_w, src_h):
             out = out.resize((src_w, src_h), Image.LANCZOS)
             buf = BytesIO()

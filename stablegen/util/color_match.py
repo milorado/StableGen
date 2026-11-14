@@ -196,7 +196,7 @@ def _apply_core(ref_rgb: np.ndarray, tgt_rgb: np.ndarray, method: str) -> np.nda
         s3 = _hist_match(ref_rgb, s2)
         return s3
     else:
-        return _reinhard(ref_rgb, tgt_rgb)
+        return _reinhard_preserve_luma(ref_rgb, tgt_rgb)
 
 
 def color_match_single(

@@ -103,6 +103,8 @@ CLASSES = [SGCameraDisplay, SG_OT_CameraDisplay, SG_OT_CameraSurfaceDisplay,
 
 
 def register():
+    from . import visibility
+    visibility.register()
     bpy.types.Scene.sg_camera_display = bpy.props.PointerProperty(type=SGCameraDisplay)
     prompt_overlay.register()
     from . import overlays
@@ -110,6 +112,8 @@ def register():
 
 
 def unregister():
+    from . import visibility
+    visibility.unregister()
     from . import overlays
     overlays.unregister_overlays()
     prompt_overlay.unregister()

@@ -18,6 +18,7 @@ import numpy as np
 
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..utils import sg_modal_active, get_file_path
+from ..util.image_io import open_backend_image
 from .pbr_emission import emission_from_hsv, emission_from_residual
 from .rendering import _RenderStateTransaction, EDIT_NORMAL_LAYER as NORMAL_LAYER
 from ..core.architectures import MASKED_EDIT_ARCHITECTURES, QWEN_ARCHITECTURES, SDXL_GRAPH_ARCHITECTURES
@@ -760,7 +761,7 @@ def world_normals(png_bytes, rotation):
     """Rotate a camera-space normal map (X right, Y up, Z to the camera, as (N+1)/2) to world space."""
     from PIL import Image
     import io
-    with Image.open(io.BytesIO(png_bytes)) as image:
+    with open_backend_image(png_bytes) as image:
         n = np.asarray(image.convert('RGB'), np.float32) / 255.0 * 2.0 - 1.0
     w = n.reshape(-1, 3) @ np.asarray(rotation, np.float32).T
     w /= np.maximum(np.linalg.norm(w, axis=1, keepdims=True), 1e-6)
@@ -843,7 +844,7 @@ def extract_pbr_maps(manager, context, jobs, settings, progress=None):
                              'Marigold IID-Appearance')
                 if 'albedo' in want and source == 'marigold':
                     save(job, 'albedo', maps[0])
-                with Image.open(io.BytesIO(maps[1])) as material:
+                with open_backend_image(maps[1]) as material:
                     material = material.convert('RGB')
                     for channel, band in (('roughness', 'R'), ('metallic', 'G')):
                         if channel in want:

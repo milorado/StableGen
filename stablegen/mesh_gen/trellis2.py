@@ -16,6 +16,7 @@ import websocket
 from PIL import Image
 
 from ..utils import get_generation_dirs, sg_modal_active
+from ..util.image_io import open_backend_image
 from ..timeout_config import get_timeout
 from .._generator_utils import setup_studio_lighting, redraw_ui, upload_image_to_comfyui
 from ..texturing.gallery import _PreviewGalleryOverlay
@@ -1982,27 +1983,20 @@ class Trellis2Generate(bpy.types.Operator):
                 # Defensive VRAM flush before loading the diffusion checkpoint.
                 # The TRELLIS post-generation flush should have freed VRAM,
                 # but if it silently failed the models are still resident (Gap C).
-                # Also clear history to release cached node outputs.
+                # Shared-server history and queued work must remain intact.
                 try:
                     srv = bpy.context.preferences.addons[_ADDON_PKG].preferences.server_address
-                    # 1. Set unload flags
-                    flush_data = json.dumps({"unload_models": True, "free_memory": True}).encode('utf-8')
-                    flush_req = urllib.request.Request(
-                        f"http://{srv}/free", data=flush_data,
-                        headers={"Content-Type": "application/json"}
-                    )
-                    urllib.request.urlopen(flush_req, timeout=get_timeout('api'))
-                    # 2. Clear history/cache
-                    hist_data = json.dumps({"clear": True}).encode('utf-8')
-                    hist_req = urllib.request.Request(
-                        f"http://{srv}/history", data=hist_data,
-                        headers={"Content-Type": "application/json"}
-                    )
-                    urllib.request.urlopen(hist_req, timeout=get_timeout('api'))
-                    # 3. Wait for VRAM release
-                    import time
-                    time.sleep(3)
-                    print("[TRELLIS2] Pre-texturing VRAM flush sent (unload+history clear)")
+                    from ..setup.runtime import owns_server
+                    if owns_server(srv):
+                        flush_data = json.dumps({"unload_models": True, "free_memory": True}).encode('utf-8')
+                        flush_req = urllib.request.Request(
+                            f"http://{srv}/free", data=flush_data,
+                            headers={"Content-Type": "application/json"}
+                        )
+                        urllib.request.urlopen(flush_req, timeout=get_timeout('api'))
+                        import time
+                        time.sleep(3)
+                        print("[TRELLIS2] Pre-texturing VRAM flush sent")
                 except Exception as flush_err:
                     print(f"[TRELLIS2] Pre-texturing flush warning: {flush_err}")
 
@@ -2160,7 +2154,7 @@ class Trellis2Generate(bpy.types.Operator):
                                 self._error = f"txt2img failed (seed {rand_seed}): {result['error']}"
                                 return
 
-                            pil_img = Image.open(io.BytesIO(result))
+                            pil_img = open_backend_image(result)
                             pil_images.append(pil_img)
                             seeds.append(rand_seed)
 

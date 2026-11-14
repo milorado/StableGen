@@ -636,6 +636,12 @@ def _startup():
     return None
 
 
+def owns_server(address):
+    """Global memory maintenance is allowed only for our local subprocess."""
+    return bool(_comfy is not None and _comfy.address == address
+                and _comfy.proc is not None and _comfy.proc.poll() is None)
+
+
 def register():
     atexit.register(_on_exit)
     if not bpy.app.background:
